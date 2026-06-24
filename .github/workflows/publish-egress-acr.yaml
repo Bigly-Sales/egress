@@ -70,8 +70,11 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libgstreamer-plugins-bad1.0-dev
 
+      # Scoped to packages that are unit-testable on a bare runner. The muxer / sink
+      # tests need the full GStreamer plugin set + cloud upload credentials and only run
+      # inside the egress runtime image (see the Integration Test workflow).
       - name: Go unit tests
-        run: go test ./pkg/...
+        run: go test ./pkg/stats/... ./pkg/config/... ./pkg/pipeline/source/pulse/...
 
   docker:
     needs: test
