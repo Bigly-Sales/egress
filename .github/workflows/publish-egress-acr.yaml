@@ -1,20 +1,17 @@
-# Build the egress image and push it to Azure Container Registry (ACR).
+# Test + build the egress image and push it to Azure Container Registry (ACR).
 #
-# This is the Bigly-Sales internal counterpart to publish-egress.yaml (which pushes to
-# Docker Hub). It builds ./build/egress/Dockerfile and pushes to our ACR.
+# Bigly-Sales internal CI for egress. Runs Go unit tests, then builds
+# ./build/egress/Dockerfile. On pull requests it builds without pushing (validation);
+# on workflow_dispatch and version tags it pushes to our ACR.
 #
 # Required GitHub secrets (Settings -> Secrets and variables -> Actions):
-#   ACR_USERNAME   - ACR login username (admin user, or a service-principal/token appId)
-#   ACR_PASSWORD   - matching password/token
+#   ACR_USERNAME, ACR_PASSWORD - ACR push credentials (admin user or SP/token).
 # Optional repo variables:
-#   ACR_LOGIN_SERVER  - overrides the registry below (default: acrsharedsouthcentralusbiglysales.azurecr.io)
-#   EGRESS_IMAGE_NAME - overrides the repository/image name (default: livekit-egress)
-#   DOCKERHUB_USERNAME / secret DOCKERHUB_TOKEN - optional, only to avoid Docker Hub
+#   ACR_LOGIN_SERVER  (default: acrsharedsouthcentralusbiglysales.azurecr.io)
+#   EGRESS_IMAGE_NAME (default: livekit-egress)
+#   DOCKERHUB_USERNAME + secret DOCKERHUB_TOKEN - optional, only to avoid Docker Hub
 #     anonymous pull-rate limits when fetching the livekit/* base images.
 #
-# Triggers:
-#   - workflow_dispatch: build any branch on demand (e.g. the fix branch) into ACR.
-#   - push tags v*.*.*: publish release images.
 # NOTE: workflow_dispatch runs the copy of this file on the selected branch, so the branch
 # you build must contain this workflow file.
 
@@ -27,6 +24,7 @@ on:
         description: "Optional extra image tag (e.g. canary)"
         required: false
         type: string
+  pull_request:
   push:
     tags:
       - 'v*.*.*'
@@ -39,12 +37,44 @@ permissions:
   contents: read
 
 env:
-  # Override via repo variables if needed.
   REGISTRY: ${{ vars.ACR_LOGIN_SERVER || 'acrsharedsouthcentralusbiglysales.azurecr.io' }}
   IMAGE_NAME: ${{ vars.EGRESS_IMAGE_NAME || 'livekit-egress' }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/go/bin
+            ~/.cache/go-build
+          key: "${{ runner.os }}-egress-test-${{ hashFiles('**/go.sum') }}"
+          restore-keys: ${{ runner.os }}-egress-test
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.2
+
+      # The pulse/stats packages are cgo and link against GStreamer, so the dev headers
+      # must be present to compile and run the unit tests.
+      - name: Install GStreamer dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev
+
+      - name: Go unit tests
+        run: go test ./pkg/...
+
   docker:
+    needs: test
     runs-on: ubuntu-latest   # switch to a larger runner label if the build is too slow/OOMs
     steps:
       - uses: actions/checkout@v7
@@ -79,6 +109,7 @@ jobs:
             type=semver,pattern=v{{version}}
             type=semver,pattern=v{{major}}.{{minor}}
             type=ref,event=branch
+            type=ref,event=pr
             type=sha,format=short
             type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
@@ -97,7 +128,9 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Push only on dispatch / tags. Pull requests build for validation without pushing.
       - name: Login to ACR
+        if: ${{ github.event_name != 'pull_request' }}
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -109,7 +142,7 @@ jobs:
         with:
           context: .
           file: ./build/egress/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64   # AKS nodepools are amd64; add linux/arm64 only if needed
           tags: ${{ steps.docker-md.outputs.tags }}
           labels: ${{ steps.docker-md.outputs.labels }}
